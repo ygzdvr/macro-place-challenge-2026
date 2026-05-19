@@ -91,3 +91,15 @@ docs/
 output/
 BENCHMARK_EVALUATION_RESULTS.md
 NETLIST_CLEANING_SUMMARY.md
+
+# Claude Code
+.claude/
+os_debug.txt
+
+# Logs
+output/logs/
+output/placements/
+output/placements_v*/
+
+# Test scripts
+output/test_*.py

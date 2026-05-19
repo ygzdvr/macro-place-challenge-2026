@@ -1370,12 +1370,17 @@ class HRTPlacer:
             torch.cuda.empty_cache()
 
         # ── TILOS-eval SA polish ──
-        # Disabled by default — too slow on big benchmarks and causes crashes
-        # in the outer evaluator. Multi-restart variants provide diversity.
+        # Direct evaluator-in-the-loop SA can escape surrogate–TILOS local minima.
+        # Cost is dominated by TILOS eval time per move (scales with num_nets).
+        # Tiers calibrated to fit within ~2 min of polish budget per benchmark.
         if benchmark.num_nets < 6000 and n_hard <= 250:
-            tilos_iters = 20  # very small benchmarks only
+            tilos_iters = 40   # ibm01-class (~2s eval/move)
+        elif benchmark.num_nets < 10000 and n_hard <= 300:
+            tilos_iters = 25   # ibm02-class (~3-5s eval/move)
+        elif benchmark.num_nets < 15000 and n_hard <= 400:
+            tilos_iters = 15   # ibm09-class (~5-8s eval/move)
         else:
-            tilos_iters = 0
+            tilos_iters = 0    # too slow for large benchmarks
 
         if tilos_iters > 0:
             try:
