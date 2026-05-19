@@ -1047,6 +1047,7 @@ class HRTPlacer:
         lr_frac: float,
         label: str = "",
         init: str = "plc",  # "plc" | "spread" | "random"
+        seed_offset: int = 0,  # added to self.seed for multi-restart
     ) -> torch.Tensor:
         """One round of: gradient descent + legalization. Returns assembled placement (CPU tensor)."""
         device = self.device
@@ -1054,6 +1055,11 @@ class HRTPlacer:
         canvas_w = float(benchmark.canvas_width)
         canvas_h = float(benchmark.canvas_height)
         canvas_size = max(canvas_w, canvas_h)
+
+        # Per-strategy seed for multi-restart diversity
+        strategy_seed = self.seed + seed_offset
+        torch.manual_seed(strategy_seed)
+        np.random.seed(strategy_seed)
 
         if init == "plc":
             pos = benchmark.macro_positions.clone().to(device)
@@ -1076,13 +1082,27 @@ class HRTPlacer:
             sizes_np = benchmark.macro_sizes.numpy()
             pos_np = benchmark.macro_positions.clone().numpy().astype(np.float64)
             movable = ~benchmark.macro_fixed.numpy()
-            rng = np.random.default_rng(self.seed)
+            rng = np.random.default_rng(strategy_seed)
             for i in range(n_hard):
                 if not movable[i]:
                     continue
                 w, h = sizes_np[i]
                 pos_np[i, 0] = rng.uniform(w/2, canvas_w - w/2)
                 pos_np[i, 1] = rng.uniform(h/2, canvas_h - h/2)
+            pos = torch.from_numpy(pos_np).float().to(device)
+        elif init == "plc_perturb":
+            # Initial placement + random perturbation
+            sizes_np = benchmark.macro_sizes.numpy()
+            pos_np = benchmark.macro_positions.clone().numpy().astype(np.float64)
+            movable = ~benchmark.macro_fixed.numpy()
+            rng = np.random.default_rng(strategy_seed)
+            sigma = canvas_size * 0.05
+            for i in range(n_hard):
+                if not movable[i]:
+                    continue
+                w, h = sizes_np[i]
+                pos_np[i, 0] = np.clip(pos_np[i, 0] + rng.normal(0, sigma), w/2, canvas_w - w/2)
+                pos_np[i, 1] = np.clip(pos_np[i, 1] + rng.normal(0, sigma), h/2, canvas_h - h/2)
             pos = torch.from_numpy(pos_np).float().to(device)
         else:
             raise ValueError(f"unknown init: {init}")
@@ -1184,23 +1204,30 @@ class HRTPlacer:
                                       lr_frac=self.lr_frac, label="single")
 
         # ── Multi-strategy: run several variants, pick best by TILOS proxy ──
-        # Ranked by past performance: grad_50_lr1e-4 wins on ibm01, ibm04, ibm17.
-        # On very large benchmarks legalization is slow; trim less promising variants.
+        # Each tuple: (name, steps, lr, init, seed_offset)
+        # Multi-restart with different seeds exploits GPU non-determinism +
+        # different initial perturbations to find better basins.
         n_hard = benchmark.num_hard_macros
         if n_hard <= 400:
             strategies = [
-                ("legal_only",        0, 0.0),
-                ("grad_25_lr1e-4",    25, 0.0001),
-                ("grad_50_lr1e-4",    50, 0.0001),
-                ("grad_100_lr1e-4",   100, 0.0001),
-                ("grad_50_lr5e-4",    50, 0.0005),
+                ("legal_only",            0,   0.0,    "plc", 0),
+                ("grad_50_lr1e-4_s0",     50,  0.0001, "plc", 0),
+                ("grad_100_lr1e-4_s0",   100,  0.0001, "plc", 0),
+                ("grad_50_lr1e-4_s1",     50,  0.0001, "plc", 1),
+                ("grad_100_lr1e-4_s2",   100,  0.0001, "plc", 2),
+                ("grad_50_lr1e-4_pert",   50,  0.0001, "plc_perturb", 0),
+                ("grad_50_lr1e-4_spread", 50,  0.0001, "spread", 0),
+                ("grad_25_lr1e-4",        25,  0.0001, "plc", 0),
+                ("grad_50_lr5e-4",        50,  0.0005, "plc", 0),
             ]
         else:
-            # Large benchmarks: top-3 strategies (drop dominated grad_25, grad_5e-4)
+            # Large benchmarks: trim count to keep runtime reasonable
             strategies = [
-                ("legal_only",        0, 0.0),
-                ("grad_50_lr1e-4",    50, 0.0001),
-                ("grad_100_lr1e-4",   100, 0.0001),
+                ("legal_only",          0,   0.0,    "plc", 0),
+                ("grad_50_lr1e-4_s0",   50,  0.0001, "plc", 0),
+                ("grad_100_lr1e-4_s0", 100,  0.0001, "plc", 0),
+                ("grad_50_lr1e-4_s1",   50,  0.0001, "plc", 1),
+                ("grad_50_lr1e-4_pert", 50,  0.0001, "plc_perturb", 0),
             ]
 
         # Load PlacementCost ONCE for TILOS evaluation
@@ -1218,10 +1245,16 @@ class HRTPlacer:
                                       global_steps=50, lr_frac=0.0005, label="fallback")
 
         candidates = []
-        for name, steps, lr in strategies:
+        for strategy_tuple in strategies:
+            if len(strategy_tuple) == 5:
+                name, steps, lr, init, seed_offset = strategy_tuple
+            else:
+                name, steps, lr = strategy_tuple
+                init, seed_offset = "plc", 0
             try:
                 placement = self._run_pipeline(benchmark, net, sizes, fixed, movable_mask,
-                                               global_steps=steps, lr_frac=lr, label=name)
+                                               global_steps=steps, lr_frac=lr, label=name,
+                                               init=init, seed_offset=seed_offset)
                 t0 = time.time()
                 c = _tilos_proxy(placement, benchmark, plc)
                 t_eval = time.time() - t0
@@ -1271,24 +1304,55 @@ class HRTPlacer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # ── TILOS-eval SA polish (optional, slow but accurate) ──
-        if self.run_tilos_sa:
-            t0 = time.time()
-            sizes_np = sizes[:n_hard].cpu().numpy().astype(np.float64)
-            fixed_np = fixed[:n_hard].cpu().numpy()
-            pol_tilos, tilos_cost = sa_polish_tilos(
-                best_placement.cpu(), benchmark, plc, sizes_np, fixed_np,
-                iters=self.tilos_sa_iters, seed=self.seed, verbose=self.verbose,
-            )
-            t_tilos = time.time() - t0
-            c_tilos = _tilos_proxy(pol_tilos, benchmark, plc)
-            self._log(f"  [TILOS-SA] TILOS proxy={c_tilos['proxy_cost']:.4f}  overlaps={c_tilos['overlap_count']}  [{t_tilos:.1f}s]")
-            if c_tilos['overlap_count'] == 0 and c_tilos['proxy_cost'] < best_proxy:
-                best_placement = pol_tilos
-                best_proxy = c_tilos['proxy_cost']
-                best_name = "TILOS-SA"
+        # ── TILOS-eval SA polish ──
+        # Conservative iter counts to keep runtime/memory bounded.
+        # Variance from gradient is high; TILOS-SA adds small improvement
+        # on average but can cause OOM/crashes on larger benchmarks.
+        if benchmark.num_nets < 8000 and n_hard <= 300:
+            tilos_iters = 50
+        elif benchmark.num_nets < 15000 and n_hard <= 400:
+            tilos_iters = 20
+        else:
+            tilos_iters = 0  # too slow / risky
+
+        if tilos_iters > 0:
+            try:
+                t0 = time.time()
+                sizes_np = sizes[:n_hard].cpu().numpy().astype(np.float64)
+                fixed_np = fixed[:n_hard].cpu().numpy()
+                pol_tilos, tilos_cost = sa_polish_tilos(
+                    best_placement.cpu(), benchmark, plc, sizes_np, fixed_np,
+                    iters=tilos_iters, seed=self.seed, verbose=False,
+                )
+                t_tilos = time.time() - t0
+                c_tilos = _tilos_proxy(pol_tilos, benchmark, plc)
+                self._log(f"  [TILOS-SA] iters={tilos_iters}  TILOS proxy={c_tilos['proxy_cost']:.4f}  overlaps={c_tilos['overlap_count']}  [{t_tilos:.1f}s]")
+                if c_tilos['overlap_count'] == 0 and c_tilos['proxy_cost'] < best_proxy:
+                    best_placement = pol_tilos
+                    best_proxy = c_tilos['proxy_cost']
+                    best_name = "TILOS-SA"
+            except Exception as e:
+                self._log(f"  [TILOS-SA] FAILED: {e}")
 
         self._log(f"BEST = {best_name}  proxy={best_proxy:.4f}")
+
+        # ── Save placement to disk as recovery safety net ──
+        # If the outer evaluator crashes after place() returns, we can still
+        # recover the placement and re-evaluate.
+        try:
+            import os
+            save_dir = os.environ.get("HRT_SAVE_DIR", "/tmp/hrt_placements")
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = f"{save_dir}/{benchmark.name}.pt"
+            torch.save({
+                "placement": best_placement.detach().cpu(),
+                "proxy": best_proxy,
+                "strategy": best_name,
+                "benchmark": benchmark.name,
+            }, save_path)
+            self._log(f"  saved placement: {save_path}")
+        except Exception as e:
+            self._log(f"  save failed: {e}")
 
         # ── Final cleanup: release GPU memory so outer evaluator has room ──
         # The outer evaluate.py will run compute_proxy_cost which is CPU-bound
