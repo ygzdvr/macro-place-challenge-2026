@@ -39,6 +39,15 @@ try:
 except Exception:
     _HAS_TILOS = False
 
+# Optional FFT-density (ePlace electrostatic) for 2-phase global placement
+try:
+    import os, sys as _sys
+    _sys.path.insert(0, os.path.dirname(__file__))
+    from fft_density import fft_density_loss
+    _HAS_FFT = True
+except Exception:
+    _HAS_FFT = False
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Pin-level connectivity tensors
@@ -1046,8 +1055,11 @@ class HRTPlacer:
         global_steps: int,
         lr_frac: float,
         label: str = "",
-        init: str = "plc",  # "plc" | "spread" | "random"
+        init: str = "plc",  # "plc" | "spread" | "random" | "plc_perturb"
         seed_offset: int = 0,  # added to self.seed for multi-restart
+        fft_phase_steps: int = 0,  # ePlace-style spreading phase before top-k
+        cong_weight: float = 0.5,
+        den_weight: float = 0.5,
     ) -> torch.Tensor:
         """One round of: gradient descent + legalization. Returns assembled placement (CPU tensor)."""
         device = self.device
@@ -1109,25 +1121,58 @@ class HRTPlacer:
 
         pos = pos.detach().requires_grad_(True)
 
-        if global_steps > 0:
-            # Auto-balance weights from init magnitudes
-            with torch.no_grad():
-                pin_xy = compute_pin_positions(pos, net)
-                gamma_init = self.gamma_init_frac * canvas_size
-                wl0 = hpwl_lse(pin_xy, net.pin_net, net.num_nets, gamma_init).item()
-                den0 = density_loss(pos, sizes, canvas_w, canvas_h,
-                                    benchmark.grid_rows, benchmark.grid_cols,
-                                    top_k_frac=0.10, use_smooth_topk=True, smooth_tau=self.smooth_tau).item()
-                cong0 = rudy_congestion_loss(pin_xy, net.pin_net, net.num_nets, canvas_w, canvas_h,
-                                             benchmark.grid_rows, benchmark.grid_cols,
-                                             top_k_frac=0.05, smooth_range=2,
-                                             use_smooth_topk=True, smooth_tau=self.smooth_tau).item()
-            w_wl = 1.0 / (abs(wl0) + 1e-9)
-            w_den = 0.5 / (abs(den0) + 1e-9)
-            w_cong = 0.5 / (abs(cong0) + 1e-9)
+        # Auto-balance weights from INITIAL placement (before any optimization)
+        # so the normalization is consistent across phases.
+        gamma_init = self.gamma_init_frac * canvas_size
+        with torch.no_grad():
+            pin_xy = compute_pin_positions(pos, net)
+            wl0 = hpwl_lse(pin_xy, net.pin_net, net.num_nets, gamma_init).item()
+            den0 = density_loss(pos, sizes, canvas_w, canvas_h,
+                                benchmark.grid_rows, benchmark.grid_cols,
+                                top_k_frac=0.10, use_smooth_topk=True, smooth_tau=self.smooth_tau).item()
+            cong0 = rudy_congestion_loss(pin_xy, net.pin_net, net.num_nets, canvas_w, canvas_h,
+                                         benchmark.grid_rows, benchmark.grid_cols,
+                                         top_k_frac=0.05, smooth_range=2,
+                                         use_smooth_topk=True, smooth_tau=self.smooth_tau).item()
+            den_fft0 = None
+            if fft_phase_steps > 0 and _HAS_FFT:
+                den_fft0 = fft_density_loss(pos, sizes, canvas_w, canvas_h,
+                                             benchmark.grid_rows, benchmark.grid_cols).item()
+        w_wl = 1.0 / (abs(wl0) + 1e-9)
+        w_den = den_weight / (abs(den0) + 1e-9)
+        w_cong = cong_weight / (abs(cong0) + 1e-9)
+        w_fft = (0.5 / (abs(den_fft0) + 1e-9)) if den_fft0 is not None else 0.0
 
-            lr = lr_frac * canvas_size
-            optimizer = torch.optim.Adam([pos], lr=lr)
+        # SINGLE Adam optimizer carried across both phases (preserves momentum).
+        lr = lr_frac * canvas_size
+        optimizer = torch.optim.Adam([pos], lr=lr)
+
+        # Total gradient steps for unified gamma schedule
+        total_steps = fft_phase_steps + global_steps
+
+        # ── Phase 0: ePlace-style global spreading (FFT density) ──
+        if fft_phase_steps > 0 and _HAS_FFT:
+            t_f0 = time.time()
+            for step in range(fft_phase_steps):
+                frac = step / max(1, total_steps - 1)
+                gamma = gamma_init * (self.gamma_final_frac / self.gamma_init_frac) ** frac
+                optimizer.zero_grad()
+                pin_xy = compute_pin_positions(pos, net)
+                wl = hpwl_lse(pin_xy, net.pin_net, net.num_nets, gamma)
+                den_fft_v = fft_density_loss(pos, sizes, canvas_w, canvas_h,
+                                              benchmark.grid_rows, benchmark.grid_cols)
+                loss = w_wl * wl + w_fft * den_fft_v
+                loss.backward()
+                with torch.no_grad():
+                    pos.grad.mul_(movable_mask)
+                    pos.grad.clamp_(-canvas_size * 0.05, canvas_size * 0.05)
+                optimizer.step()
+                with torch.no_grad():
+                    pos[:, 0].clamp_(sizes[:, 0] / 2, canvas_w - sizes[:, 0] / 2)
+                    pos[:, 1].clamp_(sizes[:, 1] / 2, canvas_h - sizes[:, 1] / 2)
+            self._log(f"  [{label}] fft_phase: {fft_phase_steps} steps  {time.time()-t_f0:.2f}s")
+
+        if global_steps > 0:
             best_loss = float("inf")
             best_pos = pos.detach().clone()
 
@@ -1207,28 +1252,38 @@ class HRTPlacer:
         # that have won on at least one benchmark in our history.
         # Each tuple: (name, steps, lr, init, seed_offset)
         n_hard = benchmark.num_hard_macros
+        # Strategies as dicts so we can extend with kwargs (fft_phase_steps, weights).
+        # Each dict: name, steps, lr, init, seed_offset, [fft_phase_steps], [cong_weight], [den_weight]
+        # FFT-phase strategies: ePlace electrostatic spreading then TILOS-aligned top-k.
+        # Empirically wins on ibm10 (1.3084 vs g50_s0 1.3101) and serves as a diversity
+        # check on others; multi-strategy picks the best by TILOS proxy.
         if n_hard <= 400:
             strategies = [
-                ("legal_only",     0,   0.0,    "plc", 0),
-                ("g25_s0",         25,  0.0001, "plc", 0),       # ibm08, ibm11 winner in v1
-                ("g50_s0",         50,  0.0001, "plc", 0),       # often winner
-                ("g100_s0",       100,  0.0001, "plc", 0),       # ibm04 winner in v1
-                ("g50_lr5e-4",     50,  0.0005, "plc", 0),       # higher LR variant
-                ("g25_s1",         25,  0.0001, "plc", 1),       # seed variants
-                ("g50_s1",         50,  0.0001, "plc", 1),
-                ("g100_s1",       100,  0.0001, "plc", 1),
-                ("g50_s2",         50,  0.0001, "plc", 2),
-                ("g100_s2",       100,  0.0001, "plc", 2),
+                {"name": "legal_only",   "steps":   0, "lr": 0.0,    "init": "plc", "seed_offset": 0},
+                {"name": "g25_s0",       "steps":  25, "lr": 0.0001, "init": "plc", "seed_offset": 0},
+                {"name": "g50_s0",       "steps":  50, "lr": 0.0001, "init": "plc", "seed_offset": 0},
+                {"name": "g100_s0",      "steps": 100, "lr": 0.0001, "init": "plc", "seed_offset": 0},
+                {"name": "g50_lr5e-4",   "steps":  50, "lr": 0.0005, "init": "plc", "seed_offset": 0},
+                {"name": "g25_s1",       "steps":  25, "lr": 0.0001, "init": "plc", "seed_offset": 1},
+                {"name": "g50_s1",       "steps":  50, "lr": 0.0001, "init": "plc", "seed_offset": 1},
+                {"name": "g100_s1",      "steps": 100, "lr": 0.0001, "init": "plc", "seed_offset": 1},
+                {"name": "g50_s2",       "steps":  50, "lr": 0.0001, "init": "plc", "seed_offset": 2},
+                {"name": "g100_s2",      "steps": 100, "lr": 0.0001, "init": "plc", "seed_offset": 2},
+                {"name": "fft25_g50_s1", "steps":  50, "lr": 0.0001, "init": "plc", "seed_offset": 1,
+                 "fft_phase_steps": 25, "cong_weight": 1.0, "den_weight": 0.5},
             ]
         else:
-            # Large benchmarks: trim to control runtime
+            # Large benchmarks: trim to control runtime, but keep one FFT variant
             strategies = [
-                ("legal_only",     0,   0.0,    "plc", 0),
-                ("g50_s0",         50,  0.0001, "plc", 0),
-                ("g100_s0",       100,  0.0001, "plc", 0),
-                ("g25_s0",         25,  0.0001, "plc", 0),
-                ("g50_s1",         50,  0.0001, "plc", 1),
-                ("g100_s1",       100,  0.0001, "plc", 1),
+                {"name": "legal_only",   "steps":   0, "lr": 0.0,    "init": "plc", "seed_offset": 0},
+                {"name": "g50_s0",       "steps":  50, "lr": 0.0001, "init": "plc", "seed_offset": 0},
+                {"name": "g100_s0",      "steps": 100, "lr": 0.0001, "init": "plc", "seed_offset": 0},
+                {"name": "g25_s0",       "steps":  25, "lr": 0.0001, "init": "plc", "seed_offset": 0},
+                {"name": "g50_lr5e-4",   "steps":  50, "lr": 0.0005, "init": "plc", "seed_offset": 0},
+                {"name": "g50_s1",       "steps":  50, "lr": 0.0001, "init": "plc", "seed_offset": 1},
+                {"name": "g100_s1",      "steps": 100, "lr": 0.0001, "init": "plc", "seed_offset": 1},
+                {"name": "fft25_g50_s1", "steps":  50, "lr": 0.0001, "init": "plc", "seed_offset": 1,
+                 "fft_phase_steps": 25, "cong_weight": 1.0, "den_weight": 0.5},
             ]
 
         # Load PlacementCost ONCE for TILOS evaluation
@@ -1246,16 +1301,25 @@ class HRTPlacer:
                                       global_steps=50, lr_frac=0.0005, label="fallback")
 
         candidates = []
-        for strategy_tuple in strategies:
-            if len(strategy_tuple) == 5:
-                name, steps, lr, init, seed_offset = strategy_tuple
+        for s in strategies:
+            # Backward-compat: accept tuple form too
+            if isinstance(s, tuple):
+                if len(s) == 5:
+                    name, steps, lr, init, seed_offset = s
+                else:
+                    name, steps, lr = s; init, seed_offset = "plc", 0
+                kw = {}
             else:
-                name, steps, lr = strategy_tuple
-                init, seed_offset = "plc", 0
+                name = s["name"]
+                steps = s["steps"]
+                lr = s["lr"]
+                init = s.get("init", "plc")
+                seed_offset = s.get("seed_offset", 0)
+                kw = {k: s[k] for k in ("fft_phase_steps", "cong_weight", "den_weight") if k in s}
             try:
                 placement = self._run_pipeline(benchmark, net, sizes, fixed, movable_mask,
                                                global_steps=steps, lr_frac=lr, label=name,
-                                               init=init, seed_offset=seed_offset)
+                                               init=init, seed_offset=seed_offset, **kw)
                 t0 = time.time()
                 c = _tilos_proxy(placement, benchmark, plc)
                 t_eval = time.time() - t0
