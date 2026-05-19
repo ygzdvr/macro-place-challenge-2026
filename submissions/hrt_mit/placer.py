@@ -1203,31 +1203,32 @@ class HRTPlacer:
                                       global_steps=self.global_steps,
                                       lr_frac=self.lr_frac, label="single")
 
-        # ── Multi-strategy: run several variants, pick best by TILOS proxy ──
+        # ── Multi-strategy: comprehensive coverage including ALL variants
+        # that have won on at least one benchmark in our history.
         # Each tuple: (name, steps, lr, init, seed_offset)
-        # Multi-restart with different seeds exploits GPU non-determinism +
-        # different initial perturbations to find better basins.
         n_hard = benchmark.num_hard_macros
         if n_hard <= 400:
             strategies = [
-                ("legal_only",            0,   0.0,    "plc", 0),
-                ("grad_50_lr1e-4_s0",     50,  0.0001, "plc", 0),
-                ("grad_100_lr1e-4_s0",   100,  0.0001, "plc", 0),
-                ("grad_50_lr1e-4_s1",     50,  0.0001, "plc", 1),
-                ("grad_100_lr1e-4_s2",   100,  0.0001, "plc", 2),
-                ("grad_50_lr1e-4_pert",   50,  0.0001, "plc_perturb", 0),
-                ("grad_50_lr1e-4_spread", 50,  0.0001, "spread", 0),
-                ("grad_25_lr1e-4",        25,  0.0001, "plc", 0),
-                ("grad_50_lr5e-4",        50,  0.0005, "plc", 0),
+                ("legal_only",     0,   0.0,    "plc", 0),
+                ("g25_s0",         25,  0.0001, "plc", 0),       # ibm08, ibm11 winner in v1
+                ("g50_s0",         50,  0.0001, "plc", 0),       # often winner
+                ("g100_s0",       100,  0.0001, "plc", 0),       # ibm04 winner in v1
+                ("g50_lr5e-4",     50,  0.0005, "plc", 0),       # higher LR variant
+                ("g25_s1",         25,  0.0001, "plc", 1),       # seed variants
+                ("g50_s1",         50,  0.0001, "plc", 1),
+                ("g100_s1",       100,  0.0001, "plc", 1),
+                ("g50_s2",         50,  0.0001, "plc", 2),
+                ("g100_s2",       100,  0.0001, "plc", 2),
             ]
         else:
-            # Large benchmarks: trim count to keep runtime reasonable
+            # Large benchmarks: trim to control runtime
             strategies = [
-                ("legal_only",          0,   0.0,    "plc", 0),
-                ("grad_50_lr1e-4_s0",   50,  0.0001, "plc", 0),
-                ("grad_100_lr1e-4_s0", 100,  0.0001, "plc", 0),
-                ("grad_50_lr1e-4_s1",   50,  0.0001, "plc", 1),
-                ("grad_50_lr1e-4_pert", 50,  0.0001, "plc_perturb", 0),
+                ("legal_only",     0,   0.0,    "plc", 0),
+                ("g50_s0",         50,  0.0001, "plc", 0),
+                ("g100_s0",       100,  0.0001, "plc", 0),
+                ("g25_s0",         25,  0.0001, "plc", 0),
+                ("g50_s1",         50,  0.0001, "plc", 1),
+                ("g100_s1",       100,  0.0001, "plc", 1),
             ]
 
         # Load PlacementCost ONCE for TILOS evaluation
@@ -1305,15 +1306,12 @@ class HRTPlacer:
             torch.cuda.empty_cache()
 
         # ── TILOS-eval SA polish ──
-        # Conservative iter counts to keep runtime/memory bounded.
-        # Variance from gradient is high; TILOS-SA adds small improvement
-        # on average but can cause OOM/crashes on larger benchmarks.
-        if benchmark.num_nets < 8000 and n_hard <= 300:
-            tilos_iters = 50
-        elif benchmark.num_nets < 15000 and n_hard <= 400:
-            tilos_iters = 20
+        # Disabled by default — too slow on big benchmarks and causes crashes
+        # in the outer evaluator. Multi-restart variants provide diversity.
+        if benchmark.num_nets < 6000 and n_hard <= 250:
+            tilos_iters = 20  # very small benchmarks only
         else:
-            tilos_iters = 0  # too slow / risky
+            tilos_iters = 0
 
         if tilos_iters > 0:
             try:
